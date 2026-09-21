@@ -45,6 +45,18 @@ PROJECT_REPO=${PROJECT_REPO:-"$ART_URL"}
 PROJECT_TEST_REPO=${PROJECT_TEST_REPO:-"$ART_URL"}
 SPARK_REPO=${SPARK_REPO:-"$ART_URL"}
 
+# Optional Apache-layout base for release tarballs only; dependencies stay in SPARK_REPO.
+# Leave unset to keep the existing distribution source, including custom builds.
+get_spark_distribution_url() {
+    local version=$1
+    local archive="spark-${version}-$2.tgz"
+    if [[ -n "${SPARK_RELEASE_BASE_URL:-}" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%s/spark-%s/%s\n' "${SPARK_RELEASE_BASE_URL%/}" "$version" "$archive"
+    else
+        printf '%s/org/apache/spark/%s/%s\n' "${SPARK_REPO%/}" "$version" "$archive"
+    fi
+}
+
 echo "CUDA_CLASSIFIER: $CUDA_CLASSIFIER, CLASSIFIER: $CLASSIFIER, PROJECT_VER: $PROJECT_VER \
     SPARK_VER: $SPARK_VER, SCALA_BINARY_VER: $SCALA_BINARY_VER"
 
