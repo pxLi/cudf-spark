@@ -45,13 +45,16 @@ PROJECT_REPO=${PROJECT_REPO:-"$ART_URL"}
 PROJECT_TEST_REPO=${PROJECT_TEST_REPO:-"$ART_URL"}
 SPARK_REPO=${SPARK_REPO:-"$ART_URL"}
 
-# Optional Apache-layout base for release tarballs only; dependencies stay in SPARK_REPO.
-# Leave unset to keep the existing distribution source, including custom builds.
+# Use the Apache mirror only for releases from the standard CI repository.
 get_spark_distribution_url() {
     local version=$1
     local archive="spark-${version}-$2.tgz"
-    if [[ -n "${SPARK_RELEASE_BASE_URL:-}" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        printf '%s/spark-%s/%s\n' "${SPARK_RELEASE_BASE_URL%/}" "$version" "$archive"
+    local artifactory_root="https://${ARTIFACTORY_NAME:-}/artifactory"
+    if [[ -n "${ARTIFACTORY_NAME:-}" &&
+          "${SPARK_REPO%/}" == "$artifactory_root/sw-spark-maven" &&
+          "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%s/sw-spark-apache-remote/spark/spark-%s/%s\n' \
+            "$artifactory_root" "$version" "$archive"
     else
         printf '%s/org/apache/spark/%s/%s\n' "${SPARK_REPO%/}" "$version" "$archive"
     fi

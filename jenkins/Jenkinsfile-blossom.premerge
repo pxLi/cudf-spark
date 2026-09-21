@@ -83,7 +83,6 @@ pipeline {
         GITHUB_TOKEN = credentials("github-token")
 
         ART_URL = "https://${common.ARTIFACTORY_NAME}/artifactory/sw-spark-maven"
-        SPARK_RELEASE_BASE_URL = "https://${common.ARTIFACTORY_NAME}/artifactory/sw-spark-apache-remote/spark"
         MVN_URM_MIRROR = '-s jenkins/settings.xml -P mirror-apache-to-urm'
         // v2 instance for CI images usage
         ART_CREDS = credentials("urm_creds")
