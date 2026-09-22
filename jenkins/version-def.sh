@@ -53,7 +53,7 @@ get_spark_distribution_url() {
     if [[ -n "${ARTIFACTORY_NAME:-}" &&
           "${SPARK_REPO%/}" == "$artifactory_root/sw-spark-maven" &&
           "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        printf '%s/sw-spark-apache-remote/spark/spark-%s/%s\n' \
+        printf '%s/sw-spark-apache/spark/spark-%s/%s\n' \
             "$artifactory_root" "$version" "$archive"
     else
         printf '%s/org/apache/spark/%s/%s\n' "${SPARK_REPO%/}" "$version" "$archive"
