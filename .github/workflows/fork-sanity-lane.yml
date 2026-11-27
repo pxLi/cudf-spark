@@ -1,0 +1,19 @@
+name: Fork CPU lane
+on:
+  workflow_call:
+    inputs:
+      row: {type: string, required: true}
+permissions: {}
+jobs:
+  standalone:
+    name: Standalone
+    if: fromJSON(inputs.row).kind != 'databricks'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run the shim group
+        env: {ROW: '${{ inputs.row }}'}
+        run: jq -e '{group,targets} | select(.targets | length > 0)' <<< "$ROW"
+  databricks:
+    name: Databricks
+    if: fromJSON(inputs.row).kind == 'databricks'
+    uses: ./.github/workflows/fork-sanity-cell.yml

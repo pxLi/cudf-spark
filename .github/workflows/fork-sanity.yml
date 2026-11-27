@@ -4,11 +4,14 @@ on:
     branches: [validation/gpu-ci-17162-20261127]
 permissions: {contents: read}
 jobs:
-  sanity:
+  select:
     if: github.repository == 'pxLi/cudf-spark'
     runs-on: ubuntu-latest
     environment: gpu-ci-sandbox
     timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      attempt: ${{ steps.select-attempt.outputs.attempt }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: {persist-credentials: false}
@@ -20,3 +23,61 @@ jobs:
         run: |
           python3 -m unittest discover -s .github/workflows/databricks-ci -q
           python3 -m unittest discover -s jenkins/databricks/tests -q
+      - name: Check AWS2 authenticated read-only API access
+        run: python3 -I .github/workflows/fork-validation/auth_probe.py
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: NVIDIA/spark-rapids-common
+          ref: 24fe496ff5b36828052d2d60a70bffb9b82cc62e
+          path: common
+          sparse-checkout: workflow-suite-selector
+          persist-credentials: false
+      - id: plan
+        run: python3 -I .github/workflows/fork-validation/plan.py
+      - id: select-attempt
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+  lane:
+    needs: select
+    name: Lane ${{ matrix.group }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    uses: ./.github/workflows/fork-sanity-lane.yml
+    with: {row: '${{ toJSON(matrix) }}'}
+
+  result:
+    needs: [select, lane]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {contents: read, actions: read}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with: {persist-credentials: false}
+      - name: Read actual lane and cleanup receipts
+        run: python3 -I .github/workflows/fork-validation/receipts.py
+        env:
+          MATRIX: ${{ needs.select.outputs.matrix }}
+          SELECTION_ATTEMPT: ${{ needs.select.outputs.attempt }}
+          GH_TOKEN: ${{ github.token }}
+
+  live-db:
+    if: github.repository == 'pxLi/cudf-spark' && github.sha == vars.FORK_DB_LIVE_SHA && github.run_attempt == 1
+    needs: select
+    runs-on: ubuntu-latest
+    environment: gpu-ci-sandbox
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with: {persist-credentials: false}
+      - name: Count one Spark row and confirm termination
+        run: python3 -I .github/workflows/fork-validation/db_smoke.py
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_SPARK_VERSION: ${{ vars.DATABRICKS_SPARK_VERSION }}
+          DATABRICKS_NODE_TYPE_ID: ${{ vars.DATABRICKS_NODE_TYPE_ID }}

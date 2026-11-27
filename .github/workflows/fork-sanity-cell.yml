@@ -1,0 +1,20 @@
+name: Fork simulation only
+on: workflow_call
+permissions: {}
+jobs:
+  cell:
+    name: Cell
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build and test on Databricks
+        env: {LIVE_SHA: '${{ vars.FORK_DB_LIVE_SHA }}'}
+        run: |
+          if [[ $GITHUB_RUN_ATTEMPT == 1 && $GITHUB_SHA != "$LIVE_SHA" ]]; then
+            sleep 12
+            echo '::error::Intentional fork-only test failure; no cluster allocated'
+            exit 1
+          fi
+          echo 'Simulated test passed on rerun'
+      - name: Confirm cluster cleanup
+        if: always()
+        run: echo 'Cleanup path executed; no cluster was allocated by this simulation'
