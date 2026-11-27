@@ -125,7 +125,7 @@ def smoke(call, name, runtime, node, build=False):
     if build:
         versions = call("GET", CLUSTERS + "/spark-versions")["versions"]
         nodes = call("GET", CLUSTERS + "/list-node-types")["node_types"]
-        if (runtime != "17.3.x-gpu-ml-scala2.13" or node != "g5.2xlarge"
+        if (runtime != "17.3.x-gpu-ml-scala2.13" or node not in {"g4dn.4xlarge", "g5.2xlarge"}
                 or runtime not in {v["key"] for v in versions}
                 or not any(n["node_type_id"] == node and n.get("num_gpus", 0) == 1
                            and not (n.get("node_info") or {}).get("status") for n in nodes)):
@@ -136,7 +136,7 @@ def smoke(call, name, runtime, node, build=False):
         created = call(
             "POST", CLUSTERS + "/create", cluster_name=name,
             spark_version=runtime, node_type_id=node, num_workers=0, autotermination_minutes=10,
-            aws_attributes={"availability": "ON_DEMAND", "first_on_demand": 1},
+            aws_attributes={"availability": "ON_DEMAND", "first_on_demand": 1, "zone_id": "auto"},
             data_security_mode="SINGLE_USER", single_user_name=principal,
             spark_conf={"spark.databricks.cluster.profile": "singleNode", "spark.master": "local[*, 4]"},
             custom_tags={"ResourceClass": "SingleNode", "SmokeRun": name},

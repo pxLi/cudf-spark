@@ -85,7 +85,7 @@ jobs:
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           FORK_DB_BUILD: '1'
           DATABRICKS_SPARK_VERSION: '17.3.x-gpu-ml-scala2.13'
-          DATABRICKS_NODE_TYPE_ID: g5.2xlarge
+          DATABRICKS_NODE_TYPE_ID: g4dn.4xlarge
       - name: Upload AWS2 build and cleanup evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
