@@ -13,6 +13,9 @@ import sys
 import time
 from urllib.parse import urlencode
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from db_console import TransientRequest, observe, run_build, verify_failure_console
+
 
 CLUSTERS = "/api/2.1/clusters"
 COMMANDS = "/api/1.2"
@@ -23,7 +26,7 @@ def workspace_api(host, token):
     if not origin or not token or not token.isascii() or not token.isprintable():
         raise RuntimeError("Expected one HTTPS Databricks workspace and a token")
 
-    def call(method, path, **fields):
+    def request(method, path, **fields):
         # Connect directly to the configured origin; never follow a redirect with the token.
         conn = http.client.HTTPSConnection(origin[1], timeout=15)
         try:
@@ -44,20 +47,28 @@ def workspace_api(host, token):
                     code = ""
                 if isinstance(code, str) and re.fullmatch(r"[a-z_]{3,64}", code):
                     reason += " " + code.upper()
-                raise RuntimeError(f"{method} {path}: HTTP {reply.status}{reason}")
+                error = TransientRequest if reply.status in (408, 429, 500, 502, 503, 504) else RuntimeError
+                raise error(f"{method} {path}: HTTP {reply.status}{reason}")
             response = json.loads(reply.read(1024 * 1024))
             if not isinstance(response, dict):
                 raise ValueError
             return response
-        except (OSError, http.client.HTTPException, ValueError) as exc:
+        except (OSError, http.client.HTTPException) as exc:
+            raise TransientRequest(f"{method} {path}: {type(exc).__name__}") from None
+        except ValueError as exc:
             raise RuntimeError(f"{method} {path}: {type(exc).__name__}") from None
         finally:
             conn.close()
 
+    def call(method, path, **fields):
+        # Never repeat cluster creation or a command submission after an ambiguous response.
+        if method == "GET":
+            return observe(lambda: request(method, path, **fields))
+        return request(method, path, **fields)
     return call
 
 
-def wait(label, read, key, target, pending, seconds):
+def wait(label, read, key, target, pending, seconds, interval=8):
     deadline = time.monotonic() + seconds
     notice = 0
     while time.monotonic() < deadline:
@@ -73,7 +84,7 @@ def wait(label, read, key, target, pending, seconds):
         if time.monotonic() >= notice:
             print(f"{label}: {state}; {int(time.monotonic() - (deadline - seconds))}s elapsed", flush=True)
             notice = time.monotonic() + 60
-        time.sleep(min(8, max(0, deadline - time.monotonic())))
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
     raise RuntimeError(f"{label}: did not reach {target} within {seconds}s")
 
 
@@ -173,15 +184,23 @@ def smoke(call, name, runtime, node, build=False):
             raise RuntimeError("Spark command did not return the expected count")
         print("Verified spark.range(1).count() == 1", flush=True)
         if build:
-            command = identifier(call("POST", COMMANDS + "/commands/execute", **ids, language="python",
-                                      command=payload), "id")
-            print("Submitted pinned repository build and one GPU test over HTTPS", flush=True)
-            result = wait("Repository build and GPU test", lambda: call("GET", COMMANDS + "/commands/status",
-                          **ids, commandId=command), "status", "Finished", ("Queued", "Running"), 120 * 60)
-            output = result.get("results") or {}
-            if result.get("id") != command or output.get("resultType") != "text":
-                raise RuntimeError("Databricks did not return the expected text build report")
-            report_build(output.get("data"))
+            def query(code):
+                command = identifier(call("POST", COMMANDS + "/commands/execute", **ids, language="python",
+                                          command=code), "id")
+                result = wait("Driver console command", lambda: call("GET", COMMANDS + "/commands/status",
+                              **ids, commandId=command), "status", "Finished", ("Queued", "Running"), 100, interval=2)
+                output = result.get("results") or {}
+                if result.get("id") != command or output.get("resultType") != "text":
+                    raise RuntimeError("No text response from the Databricks console command")
+                return json.loads(output["data"])
+
+            excerpts = {}
+            report_build(json.dumps(run_build(query, payload, excerpts=excerpts)))
+            if not excerpts.get("stdout") or not excerpts.get("stderr"):
+                raise RuntimeError("Product test passed, but fork console validation did not receive both streams")
+            print(f"Console validation: {len(excerpts['stdout'])} stdout and {len(excerpts['stderr'])} stderr lines",
+                  flush=True)
+            verify_failure_console(query)
     finally:
         state = owned().get("state")
         if state not in ("TERMINATING", "TERMINATED"):

@@ -15,10 +15,8 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: {persist-credentials: false}
-      - name: Check workspace and bastion network paths
-        run: python3 -I .github/workflows/fork-validation/network.py
-        env:
-          DB_NETWORK_TARGETS: ${{ secrets.DB_NETWORK_TARGETS }}
+      - name: Demonstrate passing and failing stdout, stderr and diagnostic tails
+        run: python3 -I .github/workflows/fork-validation/console_smoke.py
       - name: Exercise CI selection, fallback and cleanup without cloud credentials
         run: |
           python3 -m unittest discover -s .github/workflows/databricks-ci -q
