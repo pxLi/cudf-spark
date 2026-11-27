@@ -1,0 +1,22 @@
+name: Fork CI sanity
+on:
+  push:
+    branches: [validation/gpu-ci-17162-20261127]
+permissions: {contents: read}
+jobs:
+  sanity:
+    if: github.repository == 'pxLi/cudf-spark'
+    runs-on: ubuntu-latest
+    environment: gpu-ci-sandbox
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with: {persist-credentials: false}
+      - name: Check workspace and bastion network paths
+        run: python3 -I .github/workflows/fork-validation/network.py
+        env:
+          DB_NETWORK_TARGETS: ${{ secrets.DB_NETWORK_TARGETS }}
+      - name: Exercise CI selection, fallback and cleanup without cloud credentials
+        run: |
+          python3 -m unittest discover -s .github/workflows/databricks-ci -q
+          python3 -m unittest discover -s jenkins/databricks/tests -q
