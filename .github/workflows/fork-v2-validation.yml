@@ -1,73 +1,26 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Fork Databricks v2 validation
+name: Fork AWS2 inventory for 45957698780
 on:
   push:
     branches: [validation/gpu-ci-17162-20261127]
-
 permissions: {contents: read}
 
 jobs:
-  offline:
-    if: github.repository == 'pxLi/cudf-spark'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: &checkout actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with: {path: control, persist-credentials: false}
-      - uses: *checkout
-        with: &candidate
-          repository: NVIDIA/cudf-spark
-          ref: ce575b3891f0233983f3a924ca73f83cceb5c1cb
-          path: candidate
-          persist-credentials: false
-      - name: Check lifecycle, workload, cleanup and standalone selection without credentials
-        working-directory: control
-        run: |
-          /usr/bin/python3 -IB -m unittest discover -s .github/workflows/databricks-ci
-          /usr/bin/python3 -IB -m unittest discover -s jenkins/databricks/tests
-          /usr/bin/python3 -IB .github/workflows/fork-validation/v2_cell.py offline
-
-  aws2:
-    needs: offline
+  observe:
     if: >-
       github.repository == 'pxLi/cudf-spark' && github.event_name == 'push' &&
       github.ref == 'refs/heads/validation/gpu-ci-17162-20261127' &&
       github.sha == vars.FORK_DB_V2_SHA && github.run_attempt == 1
     environment: gpu-ci-sandbox
-    concurrency: {group: fork-v2-one-aws2-cell, cancel-in-progress: false}
     runs-on: ubuntu-latest
-    timeout-minutes: 185
+    timeout-minutes: 6
     steps:
-      - uses: *checkout
-        with: {ref: '${{ github.sha }}', path: control, persist-credentials: false}
-      - uses: *checkout
-        with: *candidate
-      - name: Verify inputs before exposing the protected credentials
-        run: |
-          /usr/bin/python3 -IB -c 'import requests'
-          /usr/bin/python3 -IB control/.github/workflows/fork-validation/v2_cell.py preflight
-        env:
-          FORK_DB_V2_SHA: ${{ vars.FORK_DB_V2_SHA }}
-      - name: Prepare the released Maven plugin seed in isolated fork storage
-        id: seed
-        timeout-minutes: 8
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with: {ref: '${{ github.sha }}', persist-credentials: false}
+      - name: Inspect the prior fork cell without allocating or deleting compute
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-        run: bash control/.github/workflows/fork-validation/seed_release.sh
-      - name: Run one AWS2 build and targeted test
-        id: cell
-        timeout-minutes: 155
-        env: &profile
-          FORK_DB_V2_SHA: ${{ vars.FORK_DB_V2_SHA }}
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_AWS2_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DB_MAVEN_SEED_SHA256: ${{ steps.seed.outputs.digest }}
-        run: /usr/bin/python3 -IB control/.github/workflows/fork-validation/v2_cell.py run
-      - name: Confirm exact-owned termination
-        if: always() && steps.cell.outcome != 'skipped' && steps.cell.outcome != ''
-        timeout-minutes: 15
-        env: *profile
-        run: /usr/bin/python3 -IB control/.github/workflows/fork-validation/v2_cell.py cleanup
+        run: /usr/bin/python3 -IB .github/workflows/fork-validation/reconcile_45957698780.py
