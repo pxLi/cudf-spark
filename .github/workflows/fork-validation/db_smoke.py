@@ -6,6 +6,7 @@
 import http.client
 import json
 import os
+from pathlib import Path
 import re
 import signal
 import sys
@@ -58,13 +59,20 @@ def workspace_api(host, token):
 
 def wait(label, read, key, target, pending, seconds):
     deadline = time.monotonic() + seconds
+    notice = 0
     while time.monotonic() < deadline:
         result = read()
         state = result.get(key)
         if state == target:
             return result
         if state not in pending:
-            raise RuntimeError(f"{label}: stopped before {target}")
+            observed = state if isinstance(state, str) and re.fullmatch(r"[A-Za-z_]{1,32}", state) else "unrecognized"
+            code = (result.get("termination_reason") or {}).get("code")
+            reason = f", reason={code}" if isinstance(code, str) and re.fullmatch(r"[A-Z_]{2,80}", code) else ""
+            raise RuntimeError(f"{label}: expected {target}, observed {observed}{reason}")
+        if time.monotonic() >= notice:
+            print(f"{label}: {state}; {int(time.monotonic() - (deadline - seconds))}s elapsed", flush=True)
+            notice = time.monotonic() + 60
         time.sleep(min(8, max(0, deadline - time.monotonic())))
     raise RuntimeError(f"{label}: did not reach {target} within {seconds}s")
 
@@ -76,12 +84,53 @@ def identifier(record, key):
     return value
 
 
-def smoke(call, name, runtime, node):
+def report_build(output):
+    if not isinstance(output, str) or len(output) > 32000:
+        raise RuntimeError("Missing bounded driver build report")
+    report = json.loads(output.strip())
+    if (not isinstance(report, dict) or type(report.get("ok")) is not bool
+            or not isinstance(report.get("lines"), list) or len(report["lines"]) > 120):
+        raise RuntimeError("Invalid driver build report")
+    print("Databricks driver output (post-run):", flush=True)
+    for line in report["lines"]:
+        if (not isinstance(line, str) or len(line) > 700 or not line.isascii()
+                or not line.isprintable() or re.search(
+                    r"(?i)dapi[a-f0-9]{16}|bearer |://|gh[pousr]_|github_pat_|@|"
+                    r"\b[a-z0-9-]+\.(?!(?:py|sh|test_simple_range)\b)[a-z]{2,}\b", line)):
+            raise RuntimeError("Driver output not suitable for public logs")
+        print(f"  driver | {line}", flush=True)
+    if os.environ.get("RUNNER_TEMP"):
+        evidence = Path(os.environ["RUNNER_TEMP"]) / "db-evidence"
+        evidence.mkdir(exist_ok=True)
+        (evidence / "driver.log").write_text("\n".join(report["lines"]) + "\n")
+        junit = report.get("junit")
+        if junit is not None:
+            if (not isinstance(junit, dict) or set(junit) != {"failure", "error", "skipped"}
+                    or any(type(x) is not int or x not in (0, 1) for x in junit.values())):
+                raise RuntimeError("Unexpected driver JUnit summary")
+            (evidence / "junit-summary.json").write_text(json.dumps({
+                "source": "driver pytest XML", "case": "range_test.py::test_simple_range",
+                "tests": 1, **junit}, indent=2) + "\n")
+    if not report["ok"]:
+        raise RuntimeError("Driver reported an unsuccessful repository build or test; see stage output above")
+
+
+def smoke(call, name, runtime, node, build=False):
     if not runtime.strip() or not node.strip():
         raise RuntimeError("Runtime and CPU node type must be explicitly configured")
     principal = call("GET", "/api/2.0/preview/scim/v2/Me", attributes="userName").get("userName")
     if not isinstance(principal, str) or not principal.strip():
         raise RuntimeError("Workspace did not identify the smoke principal")
+    payload = None
+    if build:
+        versions = call("GET", CLUSTERS + "/spark-versions")["versions"]
+        nodes = call("GET", CLUSTERS + "/list-node-types")["node_types"]
+        if (runtime != "17.3.x-gpu-ml-scala2.13" or node != "g5.2xlarge"
+                or runtime not in {v["key"] for v in versions}
+                or not any(n["node_type_id"] == node and n.get("num_gpus", 0) == 1
+                           and not (n.get("node_info") or {}).get("status") for n in nodes)):
+            raise RuntimeError("AWS2 does not offer the expected single-GPU node/runtime; no cluster requested")
+        payload = Path(__file__).with_name("db_build_driver.py").read_text()
     print(f"Requesting {name} (one node; 10-minute idle termination)", flush=True)
     try:
         created = call(
@@ -123,6 +172,16 @@ def smoke(call, name, runtime, node):
                 or not isinstance(output.get("data"), str) or output["data"].strip() != "1"):
             raise RuntimeError("Spark command did not return the expected count")
         print("Verified spark.range(1).count() == 1", flush=True)
+        if build:
+            command = identifier(call("POST", COMMANDS + "/commands/execute", **ids, language="python",
+                                      command=payload), "id")
+            print("Submitted pinned repository build and one GPU test over HTTPS", flush=True)
+            result = wait("Repository build and GPU test", lambda: call("GET", COMMANDS + "/commands/status",
+                          **ids, commandId=command), "status", "Finished", ("Queued", "Running"), 120 * 60)
+            output = result.get("results") or {}
+            if result.get("id") != command or output.get("resultType") != "text":
+                raise RuntimeError("Databricks did not return the expected text build report")
+            report_build(output.get("data"))
     finally:
         state = owned().get("state")
         if state not in ("TERMINATING", "TERMINATED"):
@@ -142,5 +201,6 @@ if __name__ == "__main__":
     if not all(re.fullmatch(r"[1-9][0-9]{0,19}", value) for value in (run, attempt)):
         sys.exit("Invalid workflow run identity")
     api = workspace_api(os.environ["DATABRICKS_HOST"], os.environ["DATABRICKS_TOKEN"])
-    smoke(api, f"fork-db-smoke-{run}-{attempt}", os.environ["DATABRICKS_SPARK_VERSION"],
-          os.environ["DATABRICKS_NODE_TYPE_ID"])
+    build = os.environ.get("FORK_DB_BUILD") == "1"
+    smoke(api, f"fork-db-{'build' if build else 'smoke'}-{run}-{attempt}", os.environ["DATABRICKS_SPARK_VERSION"],
+          os.environ["DATABRICKS_NODE_TYPE_ID"], build=build)

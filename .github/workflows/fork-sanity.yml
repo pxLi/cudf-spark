@@ -70,14 +70,27 @@ jobs:
     needs: select
     runs-on: ubuntu-latest
     environment: gpu-ci-sandbox
-    timeout-minutes: 45
+    timeout-minutes: 170
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: {persist-credentials: false}
-      - name: Count one Spark row and confirm termination
-        run: python3 -I .github/workflows/fork-validation/db_smoke.py
+      - name: Fetch pinned source, build the DB shim, run one GPU test, and confirm termination
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/db-evidence"
+          python3 -u -I .github/workflows/fork-validation/db_smoke.py 2>&1 | tee "$RUNNER_TEMP/db-evidence/controller.log"
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_SPARK_VERSION: ${{ vars.DATABRICKS_SPARK_VERSION }}
-          DATABRICKS_NODE_TYPE_ID: ${{ vars.DATABRICKS_NODE_TYPE_ID }}
+          FORK_DB_BUILD: '1'
+          DATABRICKS_SPARK_VERSION: '17.3.x-gpu-ml-scala2.13'
+          DATABRICKS_NODE_TYPE_ID: g5.2xlarge
+      - name: Upload AWS2 build and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: aws2-db-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/db-evidence/
+          retention-days: 3
+          if-no-files-found: warn
