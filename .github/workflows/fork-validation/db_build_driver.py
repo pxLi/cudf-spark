@@ -272,6 +272,17 @@ def driver_result(lifetime):
         if not run("gpu-check", ["nvidia-smi", "-L"], HOME, env, 30, capture=True).startswith(b"GPU 0:"):
             raise Rejected("prerequisites: no visible NVIDIA GPU")
         lines.append("DBR 17.3, NVIDIA GPU and build prerequisites confirmed")
+        stage = "DB archive cache"
+        helper = scratch / "driver_archive.py"
+        helper.write_text(ARCHIVE_TOOL)
+        for name, entry in ARCHIVE_CATALOG.items():
+            output = run(stage, ["/usr/bin/python3", "-I", str(helper), name,
+                                 json.dumps(entry), env["DBFS_CACHE_DIR"]],
+                         HOME, env, 75 * 60, capture=True)
+            label = "Maven" if name.startswith("apache-maven-") else "upstream Spark"
+            hits = {f"Verified DBFS cache hit: {name}".encode(), f"Verified legacy DBFS cache hit: {name}".encode()}
+            backend = "verified DBFS hit" if hits.intersection(output.splitlines()) else "verified local staging"
+            lines.append(f"{label} archive: {backend}")
         stage = "build"
         try:
             run(stage, ["bash", "jenkins/databricks/build.sh"], SOURCE, env, 75 * 60)

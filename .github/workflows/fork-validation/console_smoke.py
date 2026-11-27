@@ -65,7 +65,7 @@ def check_view(view, count, limit):
               f"{name}: missing, modified, or reordered public output")
 
 
-def check_render(live):
+def check_render(final):
     from db_console import driver_output, print_snapshot
 
     for in_actions in ("true", "false"):
@@ -73,7 +73,7 @@ def check_render(live):
         with patch.dict(os.environ, GITHUB_ACTIONS=in_actions), redirect_stdout(out), redirect_stderr(err):
             with driver_output():
                 for name in ("stdout", "stderr"):
-                    for line in live[name]:
+                    for line in final[name][-2:]:
                         print_snapshot({name: [line]})
         # Compare bytes including stream prefixes, original indentation and newlines.
         stdout = out.getvalue().splitlines(keepends=True)
@@ -90,15 +90,15 @@ def check_render(live):
 
 def exercise(directory, ok):
     from console_evidence import snapshot
-    from db_console import driver_output, print_snapshot, run_build
+    from db_console import driver_output, run_build
 
     count = 1008 if ok else 24
     (directory / "setup.log").write_text(OUT_OF_SCOPE + "\n", encoding="utf-8")
     if not ok:
-        # The live window contains neither PEM delimiter; payload alone is not public console text.
+        # A tail can start inside a private key. Its payload is not public console text.
         log = directory / "stderr.log"
         log.write_bytes(b"-----BEGIN PRIVATE KEY-----\n" + b"Q29uc29sZVNtb2tlQ2FuYXJ5\n" * 12000)
-        check(not any(snapshot(directory).values()), "Credential block or sibling output escaped the live window")
+        check(not any(snapshot(directory, finished=True).values()), "Credential block or sibling output escaped the tail")
         with log.open("ab") as stream:
             stream.write(b"-----END PRIVATE KEY-----\nordinary text after the block\n")
         check(snapshot(directory, finished=True)["stderr"] == ["ordinary text after the block"],
@@ -110,11 +110,9 @@ def exercise(directory, ok):
     check(rc == (0 if ok else 42), "Unexpected fixture exit status")
 
     label = "Passing fixture" if ok else "Expected failure (exit 42)"
-    live = snapshot(directory, finished=False)
-    check_view(live, count, 2)
-    if ok:  # No diagnostic channel in the passing fixture.
-        check_render(live)
     final = snapshot(directory, finished=True, ok=ok)
+    if ok:  # No diagnostic channel in the passing fixture.
+        check_render(final)
     check_view(final, count, 1000 if ok else 10)
     if not ok:
         error = "OutOfMemoryError"
@@ -126,25 +124,37 @@ def exercise(directory, ok):
     process = Mock()
     process.poll.side_effect = (None, None, rc)
     context = {}
+    get_logs = Mock(wraps=snapshot)
 
     def query(code):
         if not context:
-            context.update(json=json, _ci_dir=directory, _ci_proc=process, _ci_view={"snapshot": snapshot})
+            context.update(json=json, _ci_proc=process)
             return {"started": True}
+        polling = "_ci_dir" not in context
         reply = StringIO()
         with redirect_stdout(reply):
             exec(code, context)
         data = reply.getvalue().strip()
         check(len(data.encode("utf-8")) <= 8000, "Console reply exceeds the page budget")
-        return json.loads(data)
+        value = json.loads(data)
+        if polling:
+            terminal = process.poll.call_count == 3
+            check(value == (rc if terminal else None), "Poll returned more than completion status")
+            if terminal:
+                # Only now can the controller read any driver files or invoke the formatter.
+                context.update(_ci_dir=directory, _ci_view={"snapshot": get_logs})
+        return value
 
     excerpts = {name: [] for name in final}
-    with (patch("db_console.time.sleep"), patch("db_console.print_snapshot", wraps=print_snapshot) as rendered,
+    with (patch("db_console.time.sleep"), patch("db_console.print", wraps=print) as console,
           patch("db_console.driver_output", wraps=driver_output) as guard):
         report = run_build(query, payload="", deadline_seconds=10, label=label, excerpts=excerpts)
-        rendered.assert_any_call(live)
-        check(guard.call_count == 1 + sum(bool(lines) for lines in final.values()),
-              "Command markers must not repeat for each live poll or final page")
+        get_logs.assert_called_once_with(directory, finished=True, ok=ok)
+        channels = [name for name, lines in final.items() if lines]
+        check(guard.call_count == len(channels), "Expected one command guard per final channel")
+        groups = [call.args[0] for call in console.call_args_list if call.args[0].startswith("::group::")]
+        check(groups == ([f"::group::Final driver {name}" for name in channels] if ok else []),
+              "Only successful final channels should be collapsed")
     check(excerpts == final, "Final console pages lost, duplicated, or reordered lines")
     check(report.get("ok") is ok, "Wrong final console result")
     if not ok:

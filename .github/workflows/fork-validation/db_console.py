@@ -27,7 +27,7 @@ def observe(call):
 
 @contextmanager
 def driver_output():
-    # Guard the whole stream, not each poll or page. Keep Actions groups outside.
+    # Guard the whole channel, not each page. Keep Actions groups outside.
     marker = secrets.token_hex(16) if os.getenv("GITHUB_ACTIONS") == "true" else None
     if marker:
         print(f"::stop-commands::{marker}", flush=True)
@@ -52,8 +52,7 @@ def print_snapshot(snapshot):
 
 def run_build(query, payload, deadline_seconds=7200, label="pinned build and GPU test", excerpts=None):
     formatter = Path(__file__).with_name("console_evidence.py").read_text()
-    # A command result is only available on completion. Start one driver-local process,
-    # then issue short read-only commands in the same context while it is running.
+    # Start once. Read the logs only after the driver-local process exits.
     setup = f"""
 import json, os, subprocess, sys, tempfile
 from pathlib import Path
@@ -70,38 +69,26 @@ print(json.dumps({{"started": True}}))
 """
     if query(setup) != {"started": True}:
         raise RuntimeError("Driver did not confirm build process launch; not resubmitting")
-    print(f"Started {label}; sampling driver stdout and stderr over HTTPS", flush=True)
-
-    poll = """
-_ci_rc = _ci_proc.poll()
-try:
-    _ci_preview = _ci_view["snapshot"](_ci_dir) if _ci_rc is None else {}
-except Exception:
-    _ci_preview = {}
-print(json.dumps({"rc":_ci_rc,"preview":_ci_preview}))
-"""
-    last = {}
+    print(f"Started {label}; waiting for completion", flush=True)
     last_notice = 0
     start = time.monotonic()
-    with driver_output():
-        while time.monotonic() - start < deadline_seconds:
-            state = observe(lambda: query(poll))
-            if state["rc"] is not None:
-                break
-            preview = state["preview"]
-            try:
-                print_snapshot({k: v for k, v in preview.items() if last.get(k) != v})
-                last = preview
-            except (TypeError, ValueError):
-                print("Driver live excerpt unavailable; continuing build", flush=True)
-            if time.monotonic() >= last_notice:
-                print(f"Build/test process still running ({int(time.monotonic() - start)}s elapsed)", flush=True)
-                last_notice = time.monotonic() + 60
-            time.sleep(15)
-        else:
-            raise RuntimeError("Driver build/test process exceeded its deadline")
+    while time.monotonic() - start < deadline_seconds:
+        rc = observe(lambda: query("print(json.dumps(_ci_proc.poll()))"))
+        if rc is not None:
+            if type(rc) is not int:
+                raise ValueError("Invalid driver process exit code")
+            break
+        if time.monotonic() >= last_notice:
+            print(f"Build/test process still running ({int(time.monotonic() - start)}s elapsed)", flush=True)
+            last_notice = time.monotonic() + 60
+        time.sleep(15)
+    else:
+        raise RuntimeError("Driver build/test process exceeded its deadline")
 
-    result = query("""
+    if rc:
+        result = {"ok": False, "lines": [f"Driver build process exit {rc}"]}
+    else:
+        result = query("""
 _ci_result = _ci_dir / "result.json"
 try:
     if _ci_result.stat().st_size > 32000:
@@ -111,8 +98,6 @@ except (OSError, ValueError):
     _ci_report = {"ok":False,"lines":["Driver exited without a complete build report"]}
 print(json.dumps(_ci_report))
 """)
-    if state["rc"] != 0:
-        result = {"ok": False, "lines": [f"Driver build process exit {int(state['rc'])}"]}
     passed = result.get("ok") is True
     print("Final driver console: " + ("success tails" if passed else "failure tails and diagnostic evidence"), flush=True)
     # Fetch small pages. A truncated command response would discard the entire JSON tail.

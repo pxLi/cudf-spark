@@ -141,7 +141,12 @@ def smoke(call, name, runtime, node, build=False):
                 or not any(n["node_type_id"] == node and n.get("num_gpus", 0) == 1
                            and not (n.get("node_info") or {}).get("status") for n in nodes)):
             raise RuntimeError("AWS2 does not offer the expected single-GPU node/runtime; no cluster requested")
-        payload = Path(__file__).with_name("db_build_driver.py").read_text()
+        helpers = Path(__file__).resolve().parents[1] / "databricks-ci"
+        # Only reviewed code and public archive pins cross to the disposable driver.
+        tool = (helpers / "driver_archive.py").read_text()
+        catalog = json.loads((helpers / "archives.json").read_text())
+        payload = (f"ARCHIVE_TOOL = {tool!r}\nARCHIVE_CATALOG = {catalog!r}\n"
+                   + Path(__file__).with_name("db_build_driver.py").read_text())
     print(f"Requesting {name} (one node; 10-minute idle termination)", flush=True)
     try:
         created = call(
