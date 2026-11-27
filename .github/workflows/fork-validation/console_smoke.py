@@ -66,12 +66,15 @@ def check_view(view, count, limit):
 
 
 def check_render(live):
-    from db_console import print_snapshot
+    from db_console import driver_output, print_snapshot
 
     for in_actions in ("true", "false"):
         out, err = StringIO(), StringIO()
         with patch.dict(os.environ, GITHUB_ACTIONS=in_actions), redirect_stdout(out), redirect_stderr(err):
-            print_snapshot(live)
+            with driver_output():
+                for name in ("stdout", "stderr"):
+                    for line in live[name]:
+                        print_snapshot({name: [line]})
         # Compare bytes including stream prefixes, original indentation and newlines.
         stdout = out.getvalue().splitlines(keepends=True)
         if in_actions == "true":
@@ -87,7 +90,7 @@ def check_render(live):
 
 def exercise(directory, ok):
     from console_evidence import snapshot
-    from db_console import print_snapshot, run_build
+    from db_console import driver_output, print_snapshot, run_build
 
     count = 1008 if ok else 24
     (directory / "setup.log").write_text(OUT_OF_SCOPE + "\n", encoding="utf-8")
@@ -121,7 +124,7 @@ def exercise(directory, ok):
     # execute the controller's read-only queries against the same files across pages.
     (directory / "result.json").write_text(json.dumps({"ok": True, "lines": []}))
     process = Mock()
-    process.poll.side_effect = (None, rc)
+    process.poll.side_effect = (None, None, rc)
     context = {}
 
     def query(code):
@@ -136,9 +139,12 @@ def exercise(directory, ok):
         return json.loads(data)
 
     excerpts = {name: [] for name in final}
-    with patch("db_console.time.sleep"), patch("db_console.print_snapshot", wraps=print_snapshot) as rendered:
+    with (patch("db_console.time.sleep"), patch("db_console.print_snapshot", wraps=print_snapshot) as rendered,
+          patch("db_console.driver_output", wraps=driver_output) as guard):
         report = run_build(query, payload="", deadline_seconds=10, label=label, excerpts=excerpts)
         rendered.assert_any_call(live)
+        check(guard.call_count == 1 + sum(bool(lines) for lines in final.values()),
+              "Command markers must not repeat for each live poll or final page")
     check(excerpts == final, "Final console pages lost, duplicated, or reordered lines")
     check(report.get("ok") is ok, "Wrong final console result")
     if not ok:

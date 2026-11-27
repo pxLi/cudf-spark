@@ -1,5 +1,6 @@
 """Read sanitized driver output over the same HTTPS command context as the build."""
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -24,25 +25,29 @@ def observe(call):
             time.sleep(delay)
 
 
-def print_snapshot(snapshot):
-    # Suspend workflow commands while printing external text. Pytest node IDs,
-    # Maven output and stack traces keep ordinary punctuation, including "::".
-    marker = secrets.token_hex(16) if os.getenv("GITHUB_ACTIONS") == "true" and any(snapshot.values()) else None
+@contextmanager
+def driver_output():
+    # Guard the whole stream, not each poll or page. Keep Actions groups outside.
+    marker = secrets.token_hex(16) if os.getenv("GITHUB_ACTIONS") == "true" else None
     if marker:
         print(f"::stop-commands::{marker}", flush=True)
     try:
-        for channel in CHANNELS:
-            lines = snapshot.get(channel, [])
-            if (not isinstance(lines, list) or len(lines) > 5000 or
-                    any(not isinstance(line, str) or len(line) > 8000 or
-                        any(not c.isprintable() and c != "\t" for c in line) for line in lines)):
-                raise ValueError("Invalid driver console response")
-            stream = sys.stderr if channel == "stderr" else sys.stdout
-            for line in lines:
-                print(f"driver {channel} | {line}", file=stream, flush=True)
+        yield
     finally:
         if marker:
             print(f"::{marker}::", flush=True)
+
+
+def print_snapshot(snapshot):
+    for channel in CHANNELS:
+        lines = snapshot.get(channel, [])
+        if (not isinstance(lines, list) or len(lines) > 5000 or
+                any(not isinstance(line, str) or len(line) > 8000 or
+                    any(not c.isprintable() and c != "\t" for c in line) for line in lines)):
+            raise ValueError("Invalid driver console response")
+        stream = sys.stderr if channel == "stderr" else sys.stdout
+        for line in lines:
+            print(f"driver {channel} | {line}", file=stream, flush=True)
 
 
 def run_build(query, payload, deadline_seconds=7200, label="pinned build and GPU test", excerpts=None):
@@ -78,22 +83,23 @@ print(json.dumps({"rc":_ci_rc,"preview":_ci_preview}))
     last = {}
     last_notice = 0
     start = time.monotonic()
-    while time.monotonic() - start < deadline_seconds:
-        state = observe(lambda: query(poll))
-        if state["rc"] is not None:
-            break
-        preview = state["preview"]
-        try:
-            print_snapshot({k: v for k, v in preview.items() if last.get(k) != v})
-            last = preview
-        except (TypeError, ValueError):
-            print("Driver live excerpt unavailable; continuing build", flush=True)
-        if time.monotonic() >= last_notice:
-            print(f"Build/test process still running ({int(time.monotonic() - start)}s elapsed)", flush=True)
-            last_notice = time.monotonic() + 60
-        time.sleep(15)
-    else:
-        raise RuntimeError("Driver build/test process exceeded its deadline")
+    with driver_output():
+        while time.monotonic() - start < deadline_seconds:
+            state = observe(lambda: query(poll))
+            if state["rc"] is not None:
+                break
+            preview = state["preview"]
+            try:
+                print_snapshot({k: v for k, v in preview.items() if last.get(k) != v})
+                last = preview
+            except (TypeError, ValueError):
+                print("Driver live excerpt unavailable; continuing build", flush=True)
+            if time.monotonic() >= last_notice:
+                print(f"Build/test process still running ({int(time.monotonic() - start)}s elapsed)", flush=True)
+                last_notice = time.monotonic() + 60
+            time.sleep(15)
+        else:
+            raise RuntimeError("Driver build/test process exceeded its deadline")
 
     result = query("""
 _ci_result = _ci_dir / "result.json"
@@ -129,16 +135,19 @@ print(json.dumps({{k:len(v) for k,v in _ci_pages.items()}}))
             n = counts[channel]
             if type(n) is not int or not 0 <= n <= 32:
                 raise ValueError("Invalid console page count")
-            if passed and n:
+            if not n:
+                continue
+            if passed:
                 print(f"::group::Final driver {channel}", flush=True)
             try:
-                for i in range(n):
-                    lines = query(f'print(json.dumps(_ci_pages[{channel!r}][{i}]))')
-                    print_snapshot({channel: lines})
-                    if excerpts is not None:
-                        excerpts.setdefault(channel, []).extend(lines)
+                with driver_output():
+                    for i in range(n):
+                        lines = query(f'print(json.dumps(_ci_pages[{channel!r}][{i}]))')
+                        print_snapshot({channel: lines})
+                        if excerpts is not None:
+                            excerpts.setdefault(channel, []).extend(lines)
             finally:
-                if passed and n:
+                if passed:
                     print("::endgroup::", flush=True)
     except (OSError, RuntimeError, KeyError, TypeError, ValueError):
         print("Driver console retrieval incomplete; preserving workload result", flush=True)
