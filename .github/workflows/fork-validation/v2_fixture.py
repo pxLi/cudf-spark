@@ -26,6 +26,9 @@ def cycle(candidate, outcome):
     host = "https://example.cloud.databricks.com"
 
     def commands(method, path, **args):
+        if (method, path) == ("GET", "/api/2.0/preview/scim/v2/Me"):
+            assert args == {"attributes": "userName"}
+            return {"userName": ws.creator}
         assert path.startswith("/api/1.2/contexts/") and args["clusterId"] in ws.records
         action = (method, path.rsplit("/", 1)[1])
         contexts.append(action)
