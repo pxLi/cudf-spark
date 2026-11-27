@@ -18,7 +18,12 @@ with tempfile.TemporaryDirectory() as temp:
     print(f"Packed {count} dependency files, including {len(jars)} JARs, {len(scala)} Scala toolchain JARs; {archive.stat().st_size} bytes")
     if not scala:
         raise ValueError("No Scala artifacts from the restored Maven repository")
-    sha = hashlib.file_digest(archive.open("rb"), "sha256").hexdigest()
-    result = prove(restore, sha, (here.parents[2] / "jenkins/databricks/maven-settings.xml").read_text(), archive=archive)
+    with archive.open("rb") as stream:
+        sha = hashlib.file_digest(stream, "sha256").hexdigest()
+    # The producer's ~/.m2 is intentionally warm; emulate a different driver account on this hosted runner.
+    consumer = Path(temp) / "fresh-driver-repository"
+    consumer.mkdir()
+    result = prove(restore, sha, (here.parents[2] / "jenkins/databricks/maven-settings.xml").read_text(),
+                   archive=archive, installed=consumer)
     assert result["cold"] == "miss" and result["seeded"] == "offline-clean" and result["private"] == "absent"
     print("Maven 3.8.1: empty repository missed; full-size dependency seed passed offline")
