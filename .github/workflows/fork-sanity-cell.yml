@@ -7,14 +7,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Build and test on Databricks
-        env: {LIVE_SHA: '${{ vars.FORK_DB_LIVE_SHA }}'}
+        env: {FAILURE_SHA: '${{ vars.FORK_DB_FAILURE_SHA }}'}
         run: |
-          if [[ $GITHUB_RUN_ATTEMPT == 1 && $GITHUB_SHA != "$LIVE_SHA" ]]; then
+          if [[ $GITHUB_RUN_ATTEMPT == 1 && $GITHUB_SHA == "$FAILURE_SHA" ]]; then
             sleep 12
             echo '::error::Intentional fork-only test failure; no cluster allocated'
             exit 1
           fi
-          echo 'Simulated test passed on rerun'
+          echo 'Hosted lane simulation passed; no Databricks workload ran in this step'
       - name: Confirm cluster cleanup
         if: always()
         run: echo 'Cleanup path executed; no cluster was allocated by this simulation'

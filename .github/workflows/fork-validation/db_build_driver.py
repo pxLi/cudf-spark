@@ -110,6 +110,15 @@ def log_excerpt(label):
     return [f"{label} output | {line}" for line in found]
 
 
+def require_cache_hit(name):
+    marker = f"Found {name} in DBFS cache, copying to /tmp...".encode()
+    with STREAMS[0].open("rb") as log:
+        log.seek(OFFSETS[STREAMS[0]])
+        if any(line.rstrip(b"\r\n") == marker for line in log):
+            return f"{name}: native script used the mounted DBFS cache"
+    raise Rejected(f"{name}: native script did not report a DBFS cache hit")
+
+
 class Excerpt:
     """Retain short sections verbatim and both ends of long ones; memory is bounded."""
 
@@ -257,7 +266,7 @@ def driver_result(lifetime):
             raise Rejected("prerequisites: missing Databricks Spark or runtime jars")
         env = {"PATH": PATH, "HOME": str(HOME), "LANG": "C.UTF-8", "DB_HOME": "/databricks",
                "BASE_SPARK_VERSION": "4.0.0", "WITH_DEFAULT_UPSTREAM_SHIM": "0",
-               "DBFS_CACHE_DIR": str(HOME / ".cache/spark-ci"), "DEBIAN_FRONTEND": "noninteractive"}
+               "DEBIAN_FRONTEND": "noninteractive"}
         scratch = Path(lifetime.enter_context(tempfile.TemporaryDirectory(prefix="db-build-")))
         usable_home = HOME.is_dir() and os.access(HOME, os.W_OK | os.X_OK)
         if usable_home and any(os.path.lexists(p) for p in (SOURCE, HOME / "spark-rapids-built.tgz")):
@@ -272,26 +281,25 @@ def driver_result(lifetime):
         if not run("gpu-check", ["nvidia-smi", "-L"], HOME, env, 30, capture=True).startswith(b"GPU 0:"):
             raise Rejected("prerequisites: no visible NVIDIA GPU")
         lines.append("DBR 17.3, NVIDIA GPU and build prerequisites confirmed")
-        stage = "DB archive cache"
-        helper = scratch / "driver_archive.py"
-        helper.write_text(ARCHIVE_TOOL)
-        for name, entry in ARCHIVE_CATALOG.items():
-            output = run(stage, ["/usr/bin/python3", "-I", str(helper), name,
-                                 json.dumps(entry), env["DBFS_CACHE_DIR"]],
-                         HOME, env, 75 * 60, capture=True)
-            label = "Maven" if name.startswith("apache-maven-") else "upstream Spark"
-            hits = {f"Verified DBFS cache hit: {name}".encode(), f"Verified legacy DBFS cache hit: {name}".encode()}
-            backend = "verified DBFS hit" if hits.intersection(output.splitlines()) else "verified local staging"
-            lines.append(f"{label} archive: {backend}")
+        run("DBFS mount check", ["mountpoint", "-q", "/dbfs"], HOME, env, 10)
         stage = "build"
         try:
             run(stage, ["bash", "jenkins/databricks/build.sh"], SOURCE, env, 75 * 60)
         finally:
             lines.extend(log_excerpt(stage))
+        lines.append(require_cache_hit("Maven"))
         lines.append("jenkins/databricks/build.sh: exit 0 (DB shim only)")
         stage = "jar"
         jar = built_jar(SOURCE / "scala2.13/dist/target")
         lines.append(f"Verified Scala 2.13 distribution and spark400db173 shim ({jar.stat().st_size} bytes)")
+        stage = "upstream Spark archive"
+        # Exercise test.sh's real PART1 install, without building or testing a second plugin shim.
+        probe = scratch / "spark-version.sh"
+        probe.write_text('exec "$SPARK_HOME/bin/spark-submit" --version\n')
+        run(stage, ["bash", "jenkins/databricks/test.sh"], SOURCE,
+            {**env, "TEST_MODE": "CI_PART1", "WITH_DEFAULT_UPSTREAM_SHIM": "1",
+             "SPARK_READINESS_ONLY": "1", "SPARK_STARTUP_CHECK": str(probe)}, 15 * 60)
+        lines.append(require_cache_hit("Spark"))
         stage = "pytest"
         reports = scratch / "junit"
         reports.mkdir()

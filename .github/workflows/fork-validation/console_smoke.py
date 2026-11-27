@@ -4,6 +4,7 @@
 """Check the fork console path with a passing child and an expected exit 42, offline."""
 
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 from io import StringIO
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from threading import Event
 from unittest.mock import Mock, patch
 
 
@@ -88,6 +90,71 @@ def check_render(final):
               "Stock build output was changed during rendering")
 
 
+def exercise_transport(directory):
+    from db_smoke import command_context
+    from https_transport_v2 import run_driver, TransientRequest
+
+    calls, remote = [], {}
+    mode = "normal"
+    data = None
+
+    def api(method, path, **fields):
+        nonlocal data
+        calls.append((method, path))
+        check(fields["clusterId"] == "owned", "Unexpected cluster")
+        if path.endswith("/contexts/create"):
+            return {"id": "context"}
+        check(fields["contextId"] == "context", "Unexpected context")
+        if path.endswith("/contexts/status"):
+            return {"id": "context", "status": "Running"}
+        if path.endswith("/contexts/destroy"):
+            return {}
+        if path.endswith("/commands/execute"):
+            if mode == "ambiguous":
+                raise TransientRequest("lost submission response")
+            text = StringIO()
+            with redirect_stdout(text):
+                exec(fields["command"], remote)
+            data = text.getvalue()
+            return {"id": "command"}
+        check(path.endswith("/commands/status") and fields["commandId"] == "command", "Unexpected polling target")
+        return {"id": "command" if mode != "foreign" else "other", "status": "Finished",
+                "results": {"resultType": "text", "data": data, "truncated": mode == "truncated"}}
+
+    script = """import json, os
+from pathlib import Path
+assert "DATABRICKS_TOKEN" not in os.environ
+Path("stdout.log").write_text("[INFO] compiled public fixture\\n")
+Path("stderr.log").write_text("fixture stderr\\n")
+print(json.dumps({"ok":True, "lines":[]}))
+"""
+    digest = hashlib.sha256(script.encode()).hexdigest()
+    formatter = (HERE / "console_evidence.py").read_text()
+    with (patch("tempfile.tempdir", str(directory)), patch.dict(os.environ, DATABRICKS_TOKEN=CANARY),
+          patch("https_transport_v2.time.sleep", side_effect=lambda _: Event().wait(0.02))):
+        with command_context(api, "owned") as query:
+            try:
+                run_driver(query, script, "f" * 64, formatter)
+                raise AssertionError("Wrong payload digest accepted")
+            except ValueError as error:
+                check("SHA-256" in str(error) and len(calls) == 2, "Digest mismatch reached the driver")
+            result, snapshot = run_driver(query, script, digest, formatter, deadline_seconds=10)
+            check(result == {"ok": True, "lines": []} and snapshot["stdout"] == ["[INFO] compiled public fixture"]
+                  and snapshot["stderr"] == ["fixture stderr"], "Portable transport lost phase output")
+        check(calls[-1][1].endswith("/contexts/destroy"), "Context was not released")
+
+    for mode in ("foreign", "truncated", "ambiguous"):
+        calls.clear()
+        with command_context(api, "owned") as query:
+            try:
+                query("print(1)")
+                raise AssertionError(f"Invalid {mode} response accepted")
+            except RuntimeError:
+                pass
+        check(sum(p.endswith("/commands/execute") for _, p in calls) == 1, "Command was resubmitted")
+        check(calls[-1][1].endswith("/contexts/destroy"), "Missing cleanup after rejected response")
+
+
 def exercise(directory, ok):
     from console_evidence import snapshot
     from db_console import driver_output, run_build
@@ -146,7 +213,7 @@ def exercise(directory, ok):
         return value
 
     excerpts = {name: [] for name in final}
-    with (patch("db_console.time.sleep"), patch("db_console.print", wraps=print) as console,
+    with (patch("https_transport_v2.time.sleep"), patch("db_console.print", wraps=print) as console,
           patch("db_console.driver_output", wraps=driver_output) as guard):
         report = run_build(query, payload="", deadline_seconds=10, label=label, excerpts=excerpts)
         get_logs.assert_called_once_with(directory, finished=True, ok=ok)
@@ -167,6 +234,8 @@ if __name__ == "__main__":
     if sys.argv[1:]:
         sys.exit("Unexpected arguments")
     sys.path.insert(0, str(HERE))  # Also works with python -I.
+    with TemporaryDirectory(prefix="fork-transport-") as tmp:
+        exercise_transport(Path(tmp))
     for ok in (True, False):
         with TemporaryDirectory(prefix="fork-console-") as tmp:
             exercise(Path(tmp), ok)

@@ -1,28 +1,15 @@
 """Read sanitized driver output over the same HTTPS command context as the build."""
 
 from contextlib import contextmanager
-import json
+import hashlib
 import os
 from pathlib import Path
 import secrets
 import sys
-import time
 
 
-CHANNELS = ("stdout", "stderr", "diagnostics")
-
-class TransientRequest(RuntimeError):
-    """A temporary API or network failure, not a workload failure."""
-
-
-def observe(call):
-    for delay in (2, 5, None):
-        try:
-            return call()
-        except TransientRequest:
-            if delay is None:
-                raise
-            time.sleep(delay)
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "jenkins/databricks"))
+from https_transport_v2 import CHANNELS, run_driver
 
 
 @contextmanager
@@ -52,90 +39,23 @@ def print_snapshot(snapshot):
 
 def run_build(query, payload, deadline_seconds=7200, label="pinned build and GPU test", excerpts=None):
     formatter = Path(__file__).with_name("console_evidence.py").read_text()
-    # Start once. Read the logs only after the driver-local process exits.
-    setup = f"""
-import json, os, subprocess, sys, tempfile
-from pathlib import Path
-_ci_dir = Path(tempfile.mkdtemp(prefix="gpu-ci-console-"))
-_ci_script = _ci_dir / "build_driver.py"
-_ci_script.write_text({payload!r})
-_ci_view = {{}}
-exec(compile({formatter!r}, "console_evidence.py", "exec"), _ci_view)
-with (_ci_dir / "result.json").open("xb") as _ci_out:
-    _ci_proc = subprocess.Popen([sys.executable, "-I", str(_ci_script)], cwd=_ci_dir,
-        env={{"PATH":os.defpath, "LANG":"C.UTF-8"}}, stdin=subprocess.DEVNULL,
-        stdout=_ci_out, stderr=subprocess.DEVNULL, start_new_session=True)
-print(json.dumps({{"started": True}}))
-"""
-    if query(setup) != {"started": True}:
-        raise RuntimeError("Driver did not confirm build process launch; not resubmitting")
-    print(f"Started {label}; waiting for completion", flush=True)
-    last_notice = 0
-    start = time.monotonic()
-    while time.monotonic() - start < deadline_seconds:
-        rc = observe(lambda: query("print(json.dumps(_ci_proc.poll()))"))
-        if rc is not None:
-            if type(rc) is not int:
-                raise ValueError("Invalid driver process exit code")
-            break
-        if time.monotonic() >= last_notice:
-            print(f"Build/test process still running ({int(time.monotonic() - start)}s elapsed)", flush=True)
-            last_notice = time.monotonic() + 60
-        time.sleep(15)
-    else:
-        raise RuntimeError("Driver build/test process exceeded its deadline")
-
-    if rc:
-        result = {"ok": False, "lines": [f"Driver build process exit {rc}"]}
-    else:
-        result = query("""
-_ci_result = _ci_dir / "result.json"
-try:
-    if _ci_result.stat().st_size > 32000:
-        raise ValueError()
-    _ci_report = json.loads(_ci_result.read_text())
-except (OSError, ValueError):
-    _ci_report = {"ok":False,"lines":["Driver exited without a complete build report"]}
-print(json.dumps(_ci_report))
-""")
-    passed = result.get("ok") is True
-    print("Final driver console: " + ("success tails" if passed else "failure tails and diagnostic evidence"), flush=True)
-    # Fetch small pages. A truncated command response would discard the entire JSON tail.
-    try:
-        counts = query(f"""
-_ci_pages = {{}}
-for _key, _lines in _ci_view["snapshot"](_ci_dir, finished=True, ok={passed!r}).items():
-    _parts, _part, _size = [], [], 2
-    for _line in _lines:
-        _n = len(json.dumps(_line)) + 2
-        if _part and _size + _n > 8000:
-            _parts.append(_part)
-            _part, _size = [], 2
-        _part.append(_line)
-        _size += _n
-    _ci_pages[_key] = _parts + ([_part] if _part else [])
-print(json.dumps({{k:len(v) for k,v in _ci_pages.items()}}))
-""")
-        for channel in CHANNELS:
-            n = counts[channel]
-            if type(n) is not int or not 0 <= n <= 32:
-                raise ValueError("Invalid console page count")
-            if not n:
-                continue
-            if passed:
-                print(f"::group::Final driver {channel}", flush=True)
-            try:
-                with driver_output():
-                    for i in range(n):
-                        lines = query(f'print(json.dumps(_ci_pages[{channel!r}][{i}]))')
-                        print_snapshot({channel: lines})
-                        if excerpts is not None:
-                            excerpts.setdefault(channel, []).extend(lines)
-            finally:
-                if passed:
-                    print("::endgroup::", flush=True)
-    except (OSError, RuntimeError, KeyError, TypeError, ValueError):
-        print("Driver console retrieval incomplete; preserving workload result", flush=True)
+    result, snapshot = run_driver(query, payload, hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                                  formatter, deadline_seconds=deadline_seconds, label=label)
+    for channel, lines in snapshot.items():
+        if not lines:
+            continue
+        if result["ok"]:
+            print(f"::group::Final driver {channel}", flush=True)
+        try:
+            with driver_output():
+                print_snapshot({channel: lines})
+                if excerpts is not None:
+                    excerpts.setdefault(channel, []).extend(lines)
+        except (OSError, ValueError):
+            print("Driver console rendering incomplete; preserving workload result", flush=True)
+        finally:
+            if result["ok"]:
+                print("::endgroup::", flush=True)
     return result
 
 

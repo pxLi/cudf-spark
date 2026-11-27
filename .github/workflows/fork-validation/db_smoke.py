@@ -3,96 +3,18 @@
 
 """Run one fixed Spark command on a temporary single-node Databricks cluster."""
 
-import http.client
 import json
 import os
 from pathlib import Path
 import re
 import signal
 import sys
-import time
-from urllib.parse import urlencode
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from db_console import TransientRequest, observe, run_build, verify_failure_console
-
-
-CLUSTERS = "/api/2.1/clusters"
-COMMANDS = "/api/1.2"
-
-
-def workspace_api(host, token):
-    origin = re.fullmatch(r"https://([a-z0-9.-]+\.(?:cloud\.databricks\.com|azuredatabricks\.net|gcp\.databricks\.com))/?", host)
-    if not origin or not token or not token.isascii() or not token.isprintable():
-        raise RuntimeError("Expected one HTTPS Databricks workspace and a token")
-
-    def request(method, path, **fields):
-        # Connect directly to the configured origin; never follow a redirect with the token.
-        conn = http.client.HTTPSConnection(origin[1], timeout=15)
-        try:
-            query = "?" + urlencode(fields) if fields and method == "GET" else ""
-            body = json.dumps(fields) if method == "POST" else None
-            conn.request(method, path + query, body=body, headers={
-                "Authorization": "Bearer " + token, "Content-Type": "application/json"})
-            reply = conn.getresponse()
-            if reply.status != 200:
-                diagnostic = reply.read(16384).lower()
-                network_denial = any(word in diagnostic for word in (
-                    b"ip access list", b"ip_access_list", b"network access", b"source ip",
-                    b"ip acl", b"private link", b"privatelink", b"public access is not allowed"))
-                reason = " (network policy denied)" if network_denial else ""
-                try:
-                    code = json.loads(diagnostic).get("error_code", "")
-                except (ValueError, AttributeError):
-                    code = ""
-                if isinstance(code, str) and re.fullmatch(r"[a-z_]{3,64}", code):
-                    reason += " " + code.upper()
-                error = TransientRequest if reply.status in (408, 429, 500, 502, 503, 504) else RuntimeError
-                raise error(f"{method} {path}: HTTP {reply.status}{reason}")
-            response = json.loads(reply.read(1024 * 1024))
-            if not isinstance(response, dict):
-                raise ValueError
-            return response
-        except (OSError, http.client.HTTPException) as exc:
-            raise TransientRequest(f"{method} {path}: {type(exc).__name__}") from None
-        except ValueError as exc:
-            raise RuntimeError(f"{method} {path}: {type(exc).__name__}") from None
-        finally:
-            conn.close()
-
-    def call(method, path, **fields):
-        # Never repeat cluster creation or a command submission after an ambiguous response.
-        if method == "GET":
-            return observe(lambda: request(method, path, **fields))
-        return request(method, path, **fields)
-    return call
-
-
-def wait(label, read, key, target, pending, seconds, interval=8):
-    deadline = time.monotonic() + seconds
-    notice = 0
-    while time.monotonic() < deadline:
-        result = read()
-        state = result.get(key)
-        if state == target:
-            return result
-        if state not in pending:
-            observed = state if isinstance(state, str) and re.fullmatch(r"[A-Za-z_]{1,32}", state) else "unrecognized"
-            code = (result.get("termination_reason") or {}).get("code")
-            reason = f", reason={code}" if isinstance(code, str) and re.fullmatch(r"[A-Z_]{2,80}", code) else ""
-            raise RuntimeError(f"{label}: expected {target}, observed {observed}{reason}")
-        if time.monotonic() >= notice:
-            print(f"{label}: {state}; {int(time.monotonic() - (deadline - seconds))}s elapsed", flush=True)
-            notice = time.monotonic() + 60
-        time.sleep(min(interval, max(0, deadline - time.monotonic())))
-    raise RuntimeError(f"{label}: did not reach {target} within {seconds}s")
-
-
-def identifier(record, key):
-    value = record.get(key)
-    if not isinstance(value, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", value):
-        raise RuntimeError(f"Missing or invalid {key} in API response")
-    return value
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parents[2] / "jenkins/databricks"))
+from https_transport_v2 import CLUSTERS, command_context, identifier, wait, workspace_api
+from db_console import run_build, verify_failure_console
 
 
 def report_build(output):
@@ -141,12 +63,7 @@ def smoke(call, name, runtime, node, build=False):
                 or not any(n["node_type_id"] == node and n.get("num_gpus", 0) == 1
                            and not (n.get("node_info") or {}).get("status") for n in nodes)):
             raise RuntimeError("AWS2 does not offer the expected single-GPU node/runtime; no cluster requested")
-        helpers = Path(__file__).resolve().parents[1] / "databricks-ci"
-        # Only reviewed code and public archive pins cross to the disposable driver.
-        tool = (helpers / "driver_archive.py").read_text()
-        catalog = json.loads((helpers / "archives.json").read_text())
-        payload = (f"ARCHIVE_TOOL = {tool!r}\nARCHIVE_CATALOG = {catalog!r}\n"
-                   + Path(__file__).with_name("db_build_driver.py").read_text())
+        payload = Path(__file__).with_name("db_build_driver.py").read_text()
     print(f"Requesting {name} (one node; 10-minute idle termination)", flush=True)
     try:
         created = call(
@@ -173,39 +90,19 @@ def smoke(call, name, runtime, node, build=False):
         print("Confirmed owned AWS2 cluster RUNNING", flush=True)
         if ready.get("num_workers") != 0 or ready.get("node_type_id") != node:
             raise RuntimeError("Workspace did not provision the requested single-node compute")
-        context = identifier(call("POST", COMMANDS + "/contexts/create", clusterId=cluster, language="python"), "id")
-        ids = {"clusterId": cluster, "contextId": context}
-        ready = wait("Context startup", lambda: call("GET", COMMANDS + "/contexts/status", **ids),
-                     "status", "Running", ("Pending",), 180)
-        if ready.get("id") != context:
-            raise RuntimeError("Unexpected execution context in status response")
-        command = identifier(call("POST", COMMANDS + "/commands/execute", **ids, language="python",
-                                  command="print(spark.range(1).count())"), "id")
-        result = wait("Spark command", lambda: call("GET", COMMANDS + "/commands/status", **ids, commandId=command),
-                      "status", "Finished", ("Queued", "Running"), 180)
-        output = result.get("results") or {}
-        if (result.get("id") != command or output.get("resultType") != "text"
-                or not isinstance(output.get("data"), str) or output["data"].strip() != "1"):
-            raise RuntimeError("Spark command did not return the expected count")
-        print("Verified spark.range(1).count() == 1", flush=True)
-        if build:
-            def query(code):
-                command = identifier(call("POST", COMMANDS + "/commands/execute", **ids, language="python",
-                                          command=code), "id")
-                result = wait("Driver console command", lambda: call("GET", COMMANDS + "/commands/status",
-                              **ids, commandId=command), "status", "Finished", ("Queued", "Running"), 100, interval=2)
-                output = result.get("results") or {}
-                if result.get("id") != command or output.get("resultType") != "text":
-                    raise RuntimeError("No text response from the Databricks console command")
-                return json.loads(output["data"])
-
-            excerpts = {}
-            report_build(json.dumps(run_build(query, payload, excerpts=excerpts)))
-            if not excerpts.get("stdout") or not excerpts.get("stderr"):
-                raise RuntimeError("Product test passed, but fork console validation did not receive both streams")
-            print(f"Console validation: {len(excerpts['stdout'])} stdout and {len(excerpts['stderr'])} stderr lines",
-                  flush=True)
-            verify_failure_console(query)
+        with command_context(call, cluster) as query:
+            result = query("print(spark.range(1).count())", timeout_seconds=180)
+            if type(result) is not int or result != 1:
+                raise RuntimeError("Spark command did not return the expected count")
+            print("Verified spark.range(1).count() == 1", flush=True)
+            if build:
+                excerpts = {}
+                report_build(json.dumps(run_build(query, payload, excerpts=excerpts)))
+                if not excerpts.get("stdout") or not excerpts.get("stderr"):
+                    raise RuntimeError("Product test passed, but fork console validation did not receive both streams")
+                print(f"Console validation: {len(excerpts['stdout'])} stdout and {len(excerpts['stderr'])} stderr lines",
+                      flush=True)
+                verify_failure_console(query)
     finally:
         state = owned().get("state")
         if state not in ("TERMINATING", "TERMINATED"):

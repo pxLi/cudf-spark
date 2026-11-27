@@ -35,6 +35,8 @@ jobs:
           persist-credentials: false
       - id: plan
         run: python3 -I .github/workflows/fork-validation/plan.py
+      - name: Verify standalone UT and IT sharding and JUnit gating on hosted CPU
+        run: python3 -IB .github/workflows/fork-validation/standalone_check.py
       - id: select-attempt
         run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
@@ -72,14 +74,6 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: {persist-credentials: false}
-      - name: Warm AWS2 DBFS archives and check for repeat hits (no cluster)
-        continue-on-error: true
-        env:
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-        run: |
-          python3 -IB .github/workflows/databricks-ci/prepare_archives.py ensure
-          python3 -IB .github/workflows/databricks-ci/prepare_archives.py ensure
       - name: Fetch pinned source, build the DB shim, run one GPU test, and confirm termination
         shell: bash
         run: |
