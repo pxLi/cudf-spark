@@ -7,114 +7,148 @@ import json
 import os
 import re
 import stat
+from ipaddress import IPv6Address
+from urllib.parse import urlsplit
 
 
 _WINDOW = 256 * 1024
 _BUDGET = 56 * 1024
 _OMITTED = "[... omitted ...]"
 _SGR = re.compile(rb"\x1b\[[0-9;:]*m")
-_PRIVATE = re.compile(
-    r"(?i)\b(?:authorization|bearer|cookie|credential\w*|password|passwd|secret\w*|token|"
-    r"private key|proxy|[a-z0-9_]*(?:_key|_token|_password|_secret))\b|"
-    r"-----BEGIN |://|(?<=\S)@(?=\S)|[?&][\w%-]+=|(?:^|\s)\++(?:\s|$)|"
-    r"(?<!\w)(?:[0-9a-f:.]{0,45}::[0-9a-f:.]{0,45}|(?:[0-9a-f]{1,4}:){3,}[0-9a-f:.]+)(?!\w)"
-)
-_TOKEN = re.compile(r"[A-Za-z0-9_./@%$=+~\\-]+")
-# Only public build vocabulary survives verbatim, not arbitrary Maven arguments,
-# host labels, dependency coordinates, environment values or driver exception text.
-_WORDS = set("""
-a an the and or in of on at for to from by with without as is was are were not no
-info warn warning warnings error errors debug fatal success successful failure failures failed
-starting started running finished complete completed skipped skip passed pass collected selected
-build building builds reactor order summary total time elapsed wall clock minutes seconds min sec s ms
-compiling compile compiled compiler compilation sources source resources resource files file classes
-java scala python spark maven junit pytest tests test suites suite plugin plugins module project
-executing execute execution phase goal goals install installing installed package packages packaging
-dependency dependencies resolution resolving resolved download downloading downloaded transfer transferred
-copy copying clean cleaned scanning checking processing generating generated writing reading validating
-progress done up-to-date changes detected recompiling nothing all some one more missing invalid required
-main warning deprecated feature found cannot could unable find symbol class method type value exception
-caused reason expected actual return returned rc exit code timed out timeout signal killed terminated
-disk space left memory heap outofmemoryerror permission denied access network connection refused
-reset temporary retry retries unavailable unknown invalid argument fatal traceback most recent call last
-collect collected deselected xfailed xpassed test_simple_range range_test.py assertion assertionerror
-testsuite report reports log logs diagnostics output stdout stderr head tail lines bytes blocks
-prerequisites checkout submodules revision jar build.sh pytest git fetch sudo-check gpu-check
-initializing databricks dbr nvidia rapids cudf cuda gpu cpu driver distribution shim only
-scala-maven-plugin maven-compiler-plugin maven-surefire-plugin scala2.13 spark400db173
-reactor-summary scanning projects effective model failed-to-execute verify validate lifecycle
-disk filesystem size used avail available use mounted free total shared buff/cache swap
-linux collected items item skipped passed failed selected warnings generated error failure
-database server refused unable socket node start stop stage retry reason dependency tree
-reading package lists state information dependency tree unpacking setting up old new
-apache accelerator root sql udf optimizer worker memory mib gib stdout.log stderr.log diagnostics.log
-exit status compilation failed exception device operation permitted readonly read-only system directory
-load locate verify certificate no matching single-case classnotfoundexception sparkexception
-noclassdeffounderror unsatisfiedlinkerror filenotfounderror modulenotfounderror importerror permissionerror
-cuda_error_out_of_memory cudaerrormemoryallocation assert sudo errno pinned submodules distribution
-line lines files testcompile cannot resolve dependencies non-resolvable parent pom transfer artifact
-space left device directory such certificate verification initialization matched matching single-case
-root cause trace suppressed failed attempt aborted stack task lost scheduler executor jvm killed
-fail ran ok unittest
-""".split())
-_PUBLIC = set("""
-java.lang.OutOfMemoryError java.lang.IllegalArgumentException java.lang.NullPointerException
-java.lang.ClassNotFoundException java.lang.NoClassDefFoundError java.lang.UnsatisfiedLinkError
-java.lang.RuntimeException java.io.IOException java.io.FileNotFoundException
-java.lang.reflect.InvocationTargetException java.util.concurrent.ExecutionException
-org.apache.spark.SparkException org.apache.spark.sql.AnalysisException
-org.apache.spark.sql.catalyst.errors.package$TreeNodeException java.lang.Thread.run Thread.java
-org.apache.spark.SparkContext.runJob SparkContext.scala org.apache.spark.scheduler.DAGScheduler.runJob
-org.apache.spark.scheduler.DAGScheduler.abortStage DAGScheduler.scala
-org.apache.spark.scheduler.ResultTask.runTask ResultTask.scala org.apache.spark.scheduler.Task.run Task.scala
-org.apache.spark.executor.Executor$TaskRunner.run Executor.scala
-java.util.concurrent.ThreadPoolExecutor.runWorker java.util.concurrent.ThreadPoolExecutor$Worker.run ThreadPoolExecutor.java
-org.apache.maven.lifecycle.LifecycleExecutionException org.apache.maven.plugin.MojoFailureException
-org.apache.maven.plugins net.alchim31.maven com.nvidia com.nvidia.spark ai.rapids
-pom.xml scala2.13/pom.xml jenkins/databricks/build.sh jenkins/databricks/setup.sh
-jenkins/databricks/common_vars.sh integration_tests/run_pyspark_from_build.sh
-integration_tests/src/main/python/range_test.py
-test_console_probe.py ConsoleProbe.test_expected_failure test_console_probe.ConsoleProbe.test_expected_failure
-test_expected_failure self.assertEqual
-""".split())
-_MODULE = re.compile(r"cudf-spark(?:-(?:parent|aggregator|tests|sql|udf|shuffle|integration-tests|"
-                     r"shim-deps-parent|sql-plugin-(?:api|format|fileio|columnar)))?_2\.(?:12|13)")
-_NUMBER = re.compile(r"(?:\d{1,8}|\d{1,5}(?:\.\d{1,4}){1,2})(?:%|ms|s|m|h|[kmgt]i?b|-snapshot)?", re.I)
-_TEST_COUNT = re.compile(r"(?:failures|errors|skipped|tests|passed|warnings)=[0-9]{1,6}", re.I)
+# Only clean, public repository URLs may leave the driver. Never echo URL credentials,
+# query strings, fragments or private workspaces simply because a download failed.
+_URL = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s<>\"']+", re.I)
+_PUBLIC_REPOS = {
+    "repo.maven.apache.org", "repo1.maven.org", "repository.apache.org", "archive.apache.org",
+    "downloads.apache.org", "maven-central.storage-download.googleapis.com",
+    "oss.sonatype.org", "s01.oss.sonatype.org", "central.sonatype.com", "repo.scala-sbt.org",
+    "pypi.org", "files.pythonhosted.org", "github.com", "raw.githubusercontent.com",
+}
+_SECRET = re.compile(
+    r"(?:\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*:|\bBearer\s+[\w+/=-]+|"
+    r"\bBasic\s+[A-Za-z0-9+/]{12,}={0,2}\b|"
+    r"(?<![a-z0-9])(?:password|passwd|pwd|passphrase|(?:client[_-]?)?secret|api[_-]?key|"
+    r"(?:secret[_-]?)?access[_-]?key(?:[_-]?id)?|sig(?:nature)?|(?:sharedaccess)?signature|"
+    r"(?:storage)?account[_-]?key|fs\.azure\.account\.key(?:\.[\w.-]+)?|credential[s]?|"
+    r"x-amz-security-token|(?:access|refresh|session|id)[_-]?token)[\"']?\s*[:=]|"
+    r"token\s*=|[\"']token[\"']\s*:|^\s*token\s*:|--(?:password|token|secret|api-key)\s+\S|"
+    r"<(?:password|passphrase|privateKey|secret|token)\b|"
+    r"\b(?:gh[pousr]_\w{12,}|github_pat_\w+|glpat-[\w-]{10,}|dapi[\da-f]{16,}|(?:AKIA|ASIA)[A-Z0-9]{16}|"
+    r"xox[baprs]-[\w-]+|eyJ[\w-]{6,}\.[\w-]+\.[\w-]+|ssh-(?:rsa|ed25519)\s+\S+)|"
+    r"^\s*(?:machine\s+\S+\s+|(?:login|password|passwd)\s+\S)|\b(?:Proc-Type|DEK-Info):)", re.I)
+_NETWORK = re.compile(
+    r"\b(?:[\w-]+\.)+(?:internal|localdomain|corp|local|databricks\.(?:com|net)|"
+    r"nvidia\.com|amazonaws\.com|azure\.com|azuredatabricks\.net)\b|"
+    r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b|"
+    r"\b(?:ip-\d+-\d+-\d+-\d+|i-[0-9a-f]{8,17}|\d{4}-\d{6}-[a-z0-9]{6,})\b|"
+    r"\b(?:hostname|cluster[_. -]?(?:id|name)|workspace[_. -]?(?:id|url)|host|UnknownHostException)\s*[:=]\s*\S|"
+    r"[\w.-]+@[\w.-]+", re.I)
+_IPV6 = re.compile(r"(?<![\w:])(?:[0-9a-f]{0,4}:){2,}[0-9a-f:.]*(?!\w)", re.I)
+_COMMAND = re.compile(
+    r"^(?:\s*\[[A-Z]+\]\s*)?\s*(?:::[\w-]+(?:[ :]|$)|##(?:vso)?\[|"
+    r"(?:export\s+|declare -x\s+)?[A-Z_][A-Z_0-9]*=)")
+_GH_COMMAND = re.compile(r"::(?:warning|notice|error|debug|add-mask|stop-commands|set-output|"
+                         r"set-env|save-state|add-path|group|endgroup|echo)(?: [^\r\n:]+)?::", re.I)
+_ARMOR = re.compile(rb"-----(BEGIN|END) [A-Z0-9 ]+-----")
+# At an unknown byte boundary don't publish unframed text as if it began a new
+# record. Once a new build record starts, ordinary lines need no known vocabulary.
+_RECORD = re.compile(rb"^(?:\[(?:INFO|WARN(?:ING)?|ERROR|DEBUG|FATAL|JUnit|driver|GPU)\b|"
+                     rb"\d{2,4}[-/]\d\d[-/]\d\d[ T]|=== |Traceback \(|(?:FAIL|ERROR): )")
+_HEREDOC = re.compile(r"<<-?\s*['\"]?([A-Za-z_]\w*)['\"]?")
+_XML = re.compile(r"<(/?)(password|passphrase|privateKey|secret|token)>", re.I)
+_TRACE = re.compile(r"^\s*(?:\[[A-Z]+\]\s*)?(?:\++\s|\$\s|>>>\s|(?:Environment|Environment variables):\s*$)")
+_ENCODED_RECORD = re.compile(rb"\[[A-Z]+\]\s+[A-Za-z0-9_+/=-]+\s*")
+_TRUNCATED = re.compile(rb"\[\.\.\. \d+ bytes omitted \.\.\.\]")
 
 
-def _public(raw):
-    if len(raw) > 4096:
-        return _OMITTED
-    raw = _SGR.sub(b"", raw.removesuffix(b"\r")).replace(b"\t", b" ")
-    if not raw.isascii() or any(c < 32 or c == 127 for c in raw):
-        return None
-    line = raw.decode("ascii").strip()
-    if line == "sudo: a password is required":
-        return line  # A fixed sudo failure, not a password value.
-    if not line or line.startswith(("+", "$ ", ">>>", "::")) or _PRIVATE.search(line):
-        return None
+def _safe_text(line):
+    if (_NETWORK.search(line) or _GH_COMMAND.search(line)
+            or not all(c == "\t" or c.isprintable() for c in line)):
+        return False
+    for match in _IPV6.finditer(line):
+        if match[0] != "::":
+            try:
+                IPv6Address(match[0])
+            except ValueError:
+                continue
+            return False
 
-    def replace(match):
-        raw_token = match[0]
-        token = raw_token.rstrip(".") if raw_token[-1] == "." and raw_token[0] != "." else raw_token
-        suffix = raw_token[len(token):][:3]
-        relative = token.removeprefix("/home/ubuntu/spark-rapids/").removeprefix("./")
-        if relative.endswith("/test_console_probe.py"):
-            relative = "test_console_probe.py"
-        if relative in _PUBLIC:
-            return relative + suffix
-        if (token.lower() in _WORDS or token in {"=", "=="}
-                or _NUMBER.fullmatch(token) or _MODULE.fullmatch(token) or _TEST_COUNT.fullmatch(token)):
-            return token + suffix
-        if len(token) > 1 and set(token) in ({"-"}, {"="}, {"."}):
-            return token[:72]
-        return "[redacted]"
+    def public_url(match):
+        try:
+            url = urlsplit(match[0].rstrip(".,);]"))
+            return (url.scheme in ("https", "http") and url.hostname in _PUBLIC_REPOS
+                    and url.username is None and url.password is None and not url.query
+                    and not url.fragment and url.port in (None, 80, 443))
+        except ValueError:
+            return False
 
-    # No terminal escapes, GHA workflow commands, or uninspected tail cut out of an identifier.
-    line = re.sub(r":{2,}", lambda m: " ".join(m[0]), _TOKEN.sub(replace, line)).replace("##[", "# #[")
-    line = re.sub(r"(?:\[redacted\][ ,;]*){2,}", "[redacted] ", line).rstrip()
-    return line[:500] + _OMITTED if len(line) > 500 else line
+    return all(public_url(m) for m in _URL.finditer(line))
+
+
+def _public_lines(records, clipped):
+    public = []
+    armor = False
+    until = None
+    private_indent = None
+    for raw in records:
+        # Process delimiters even if their line is otherwise unsafe. If a fragment
+        # starts with an orphan END, discard its potentially private leading text.
+        markers = _ARMOR.findall(raw)
+        if markers:
+            for marker in markers:
+                if marker == b"END" and not armor:
+                    public.clear()
+                armor = marker == b"BEGIN"
+            clipped = False
+            continue
+        if armor:
+            continue
+        if _TRUNCATED.fullmatch(raw):
+            public.append(_OMITTED)
+            clipped = True
+            continue
+        try:
+            line = raw.removesuffix(b"\r").decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if until is not None:
+            if until.fullmatch(line.strip()):
+                until = None
+            continue
+        indent = len(line) - len(line.lstrip())
+        if private_indent is not None:
+            if not line.strip() or indent > private_indent:
+                continue
+            private_indent = None
+        xml = _XML.search(line)
+        if xml and xml[1] == "/":
+            public.clear()  # Unmatched closing tag in a fragment supplied by the driver.
+            clipped = False
+            continue
+        trace = _TRACE.search(line)
+        if trace or _SECRET.search(line) or _COMMAND.search(line):
+            if trace or line.rstrip().endswith((":", "=")):
+                clipped = True  # An xtraced echo/printenv can print an arbitrary next line.
+            heredoc = _HEREDOC.search(line)
+            if heredoc:
+                until = re.compile(re.escape(heredoc[1]))
+            elif xml and "</" + xml[2].lower() + ">" not in line.lower():
+                until = re.compile(r".*</" + re.escape(xml[2]) + r">.*", re.I)
+            elif line.count("'") % 2 or line.count('"') % 2:
+                quote = "'" if line.count("'") % 2 else '"'
+                until = re.compile(r".*" + quote + r"[,;)]?")
+            elif re.search(r"[:=]\s*[|>][+-]?\s*$", line) or re.match(
+                    r"\s*(?:proxy-authorization|authorization|cookie|set-cookie)\s*:", line, re.I):
+                private_indent = indent  # Folded HTTP header or YAML block scalar.
+            continue
+        if clipped and (not _RECORD.match(raw) or _ENCODED_RECORD.fullmatch(raw)):
+            continue
+        clipped = False
+        if len(raw) > 4096:
+            public.append(_OMITTED)
+        elif _safe_text(line):
+            public.append(line if len(line) <= 500 else line[:500] + _OMITTED)
+    return public
 
 
 def _window(stream, start, end, finish_line):
@@ -124,17 +158,19 @@ def _window(stream, start, end, finish_line):
     if start:
         raw = raw.partition(b"\n")[2]
     if not finish_line:
-        raw = raw.rpartition(b"\n")[0]
-    return raw.split(b"\n")
+        complete, sep, _ = raw.rpartition(b"\n")
+        if not sep:
+            return []
+        raw = complete
+    else:
+        raw = raw.removesuffix(b"\n")
+    return _public_lines(_SGR.sub(b"", raw).split(b"\n"), bool(start)) if raw else []
 
 
 def _take(lines, count, budget, *, tail):
     kept = []
     size = 2  # JSON array brackets; cost below includes the separator.
-    for raw in reversed(lines) if tail else lines:
-        line = _public(raw)
-        if line is None:
-            continue
+    for line in reversed(lines) if tail else lines:
         cost = len(json.dumps(line)) + 2
         if len(kept) == count or size + cost > budget:
             return (kept[::-1] if tail else kept), True

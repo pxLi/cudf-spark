@@ -1,7 +1,9 @@
 """Read sanitized driver output over the same HTTPS command context as the build."""
 
 import json
+import os
 from pathlib import Path
+import secrets
 import sys
 import time
 
@@ -23,16 +25,24 @@ def observe(call):
 
 
 def print_snapshot(snapshot):
-    for channel in CHANNELS:
-        lines = snapshot.get(channel, [])
-        if (not isinstance(lines, list) or len(lines) > 5000 or
-                any(not isinstance(line, str) or len(line) > 8000 or
-                    any(not c.isprintable() for c in line) for line in lines)):
-            raise ValueError("Invalid driver console response")
-        stream = sys.stderr if channel == "stderr" else sys.stdout
-        for line in lines:
-            # Prefix every line; driver output is never a GitHub workflow command.
-            print(f"driver {channel} | {line.replace('::', ': :')}", file=stream, flush=True)
+    # Suspend workflow commands while printing external text. Pytest node IDs,
+    # Maven output and stack traces keep ordinary punctuation, including "::".
+    marker = secrets.token_hex(16) if os.getenv("GITHUB_ACTIONS") == "true" and any(snapshot.values()) else None
+    if marker:
+        print(f"::stop-commands::{marker}", flush=True)
+    try:
+        for channel in CHANNELS:
+            lines = snapshot.get(channel, [])
+            if (not isinstance(lines, list) or len(lines) > 5000 or
+                    any(not isinstance(line, str) or len(line) > 8000 or
+                        any(not c.isprintable() and c != "\t" for c in line) for line in lines)):
+                raise ValueError("Invalid driver console response")
+            stream = sys.stderr if channel == "stderr" else sys.stdout
+            for line in lines:
+                print(f"driver {channel} | {line}", file=stream, flush=True)
+    finally:
+        if marker:
+            print(f"::{marker}::", flush=True)
 
 
 def run_build(query, payload, deadline_seconds=7200, label="pinned build and GPU test", excerpts=None):
