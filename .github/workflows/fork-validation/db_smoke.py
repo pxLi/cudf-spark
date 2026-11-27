@@ -37,6 +37,12 @@ def workspace_api(host, token):
                     b"ip access list", b"ip_access_list", b"network access", b"source ip",
                     b"ip acl", b"private link", b"privatelink", b"public access is not allowed"))
                 reason = " (network policy denied)" if network_denial else ""
+                try:
+                    code = json.loads(diagnostic).get("error_code", "")
+                except (ValueError, AttributeError):
+                    code = ""
+                if isinstance(code, str) and re.fullmatch(r"[a-z_]{3,64}", code):
+                    reason += " " + code.upper()
                 raise RuntimeError(f"{method} {path}: HTTP {reply.status}{reason}")
             response = json.loads(reply.read(1024 * 1024))
             if not isinstance(response, dict):
@@ -81,6 +87,7 @@ def smoke(call, name, runtime, node):
         created = call(
             "POST", CLUSTERS + "/create", cluster_name=name,
             spark_version=runtime, node_type_id=node, num_workers=0, autotermination_minutes=10,
+            aws_attributes={"availability": "ON_DEMAND", "first_on_demand": 1},
             data_security_mode="SINGLE_USER", single_user_name=principal,
             spark_conf={"spark.databricks.cluster.profile": "singleNode", "spark.master": "local[*, 4]"},
             custom_tags={"ResourceClass": "SingleNode", "SmokeRun": name},
@@ -98,6 +105,7 @@ def smoke(call, name, runtime, node):
 
     try:
         ready = wait("Cluster startup", owned, "state", "RUNNING", ("PENDING", "RESTARTING", "RESIZING"), 18 * 60)
+        print("Confirmed owned AWS2 cluster RUNNING", flush=True)
         if ready.get("num_workers") != 0 or ready.get("node_type_id") != node:
             raise RuntimeError("Workspace did not provision the requested single-node compute")
         context = identifier(call("POST", COMMANDS + "/contexts/create", clusterId=cluster, language="python"), "id")
