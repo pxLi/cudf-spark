@@ -1,0 +1,13 @@
+name: Fork Maven Verify
+on:
+  push:
+    branches: [validation/maven-17162-20261127]
+permissions:
+  contents: read
+jobs:
+  verify:
+    if: github.repository == 'pxLi/cudf-spark'
+    uses: ./.github/workflows/mvn-verify-check.yml
+    with:
+      merge-sha: ${{ github.sha }}
+      base-branch: main
